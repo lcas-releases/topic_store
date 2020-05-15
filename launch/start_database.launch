@@ -1,0 +1,6 @@
+<launch>
+    <!-- The database launch script will use the config at scenario_file.storage.config -->
+    <arg name="scenario_file" default="$(find topic_store)/scenarios/database_default.yaml"/>
+    <node name="docker_db_launcher" pkg="topic_store" required="true" type="docker_compose_up_safe.sh" output="screen"
+        args="$(arg scenario_file)"/>
+</launch>

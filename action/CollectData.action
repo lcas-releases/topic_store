@@ -1,0 +1,7 @@
+# Goal
+---
+# Result
+bool job_success  # True if the job was a success, False otherwise
+---
+# Feedback
+string job_status  # More specific job information stored here
