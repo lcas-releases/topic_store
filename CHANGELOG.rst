@@ -2,6 +2,11 @@
 Changelog for package topic_store
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.0.5 (2020-05-16)
+------------------
+* Reduced required TQDM version
+* Contributors: RaymondKirk
+
 0.0.4 (2020-05-15)
 ------------------
 * Enable start_database.launch to use system mongo for CI and tests
