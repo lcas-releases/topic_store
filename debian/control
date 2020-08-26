@@ -1,0 +1,13 @@
+Source: ros-melodic-topic-store
+Section: misc
+Priority: optional
+Maintainer: Raymond Kirk <rkirk@lincoln.ac.uk>
+Build-Depends: debhelper (>= 9.0.0), mongodb, python-catkin-pkg, python-pytest (>= 3.3.2), ros-melodic-actionlib, ros-melodic-actionlib-msgs, ros-melodic-catkin, ros-melodic-message-generation, ros-melodic-ros-numpy, ros-melodic-roscpp, ros-melodic-rospy, ros-melodic-sensor-msgs, ros-melodic-std-msgs
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-melodic-topic-store
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, python-numpy (>= 1.13.3), python-pathlib (>= 1.0.1), python-pymongo (>= 3.6.1), python-rospkg (>= 1.2.6), python-tqdm (>= 4.19.0), python-yaml (>= 3.12), ros-melodic-actionlib, ros-melodic-actionlib-msgs, ros-melodic-message-runtime, ros-melodic-ros-numpy, ros-melodic-roscpp, ros-melodic-rospy, ros-melodic-sensor-msgs, ros-melodic-std-msgs
+Description: The topic_store package.
+ Used for serialising common ROS topic messages to a database or filesystem.
