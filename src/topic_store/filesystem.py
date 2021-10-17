@@ -1,4 +1,4 @@
-#  Raymond Kirk (Tunstill) Copyright (c) 2020
+#  Raymond Kirk (Tunstill) Copyright (c) 2019
 #  Email: ray.tunstill@gmail.com
 
 # This file contains the interface to the filesystem storage
@@ -6,6 +6,8 @@
 from __future__ import absolute_import, division, print_function
 
 import pickle
+import sys
+
 import pathlib
 
 from topic_store.api import Storage
@@ -33,6 +35,8 @@ class TopicStorage(Storage):
         return TopicStorage(path)
 
     def insert_one(self, topic_store):
+        if isinstance(topic_store, dict):
+            topic_store = TopicStore(topic_store)
         if not isinstance(topic_store, TopicStore):
             raise ValueError("TopicStorage only supports TopicStore types")
         # Create if doesn't exist on the system
@@ -49,11 +53,19 @@ class TopicStorage(Storage):
         if not self.path.exists():
             raise StopIteration()
         with self.path.open("rb") as fh:
+            position = -1
             while True:
                 try:
-                    yield TopicStore(data_tree=pickle.load(fh))
+                    load_kwargs = {}
+                    if sys.version_info[0] >= 3:  # python3 loading
+                        load_kwargs = dict(encoding="latin1")
+                    position += 1
+                    tree = pickle.load(fh, **load_kwargs)
+                    yield TopicStore(data_tree=tree)
                 except EOFError:
                     break
+                except Exception as e:
+                    print("File at position {} is corrupt. Skipping, error: {}".format(position, e))
 
     # Add these methods back when a more efficient storage method used
     # def __getitem__(self, item=0):

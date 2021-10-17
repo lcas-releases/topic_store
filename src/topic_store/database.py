@@ -1,4 +1,4 @@
-#  Raymond Kirk (Tunstill) Copyright (c) 2020
+#  Raymond Kirk (Tunstill) Copyright (c) 2019
 #  Email: ray.tunstill@gmail.com
 
 # This file contains the interface to a mongo_db client
@@ -7,6 +7,7 @@ from __future__ import absolute_import, division, print_function
 
 import rospkg
 import bson
+import time
 import gridfs
 import pymongo
 from copy import copy
@@ -15,8 +16,9 @@ import pathlib
 
 from topic_store import get_package_root
 from topic_store.api import Storage
-from topic_store.data import TopicStore, MongoDBReverseParser, MongoDBParser
+from topic_store.data import TopicStore
 from topic_store.file_parsers import load_yaml_file
+from topic_store.sanitation import MongoDBParser, MongoDBReverseParser
 from topic_store.scenario import ScenarioFileParser
 
 try:
@@ -36,7 +38,8 @@ class MongoStorage(Storage):
     """
     suffix = ".yaml"
 
-    def __init__(self, config=None, collection="default", uri=None):
+    def __init__(self, config=None, collection="default", uri=None, db_name=None, verbose=False, chunk_size=None,
+                 use_grid_fs=False):
         """
 
         Args:
@@ -44,21 +47,37 @@ class MongoStorage(Storage):
             collection: The collection to manage
             uri: URI overload, if passed will attempt to connect directly and config not used
         """
+        if db_name is None:
+            db_name = "topic_store"
+        self.verbose = verbose
         self.uri = uri
         if self.uri is None:
             if config in ["topic_store", "auto", "default"] or config is None:
                 config = get_package_root() / "config" / "default_db_config.yaml"
             self.uri = self.uri_from_mongo_config(config)
+        self._log("Setting URI to '{}'".format(self.uri))
 
         self.parser = MongoDBParser()  # Adds support for unicode to python str etc
         self.reverse_parser = MongoDBReverseParser()  # Adds support for unicode to python str etc
-        self.name = "topic_store"
+        self.name = db_name
         self.collection_name = collection
 
         self.client = pymongo.MongoClient(self.uri)
         self._db = self.client[self.name]
-        self._fs = gridfs.GridFS(self._db, collection=self.collection_name)
+
+        self._use_grid_fs = use_grid_fs
+        if self._use_grid_fs:
+            self._fs = gridfs.GridFS(self._db, collection=self.collection_name)
+            self._db[self.collection_name + "." + "chunks"].create_index(
+                [('files_id', pymongo.ASCENDING), ('n', pymongo.ASCENDING)], unique=True
+            )
+            self._db[self.collection_name + "." + "files"].create_index(
+                [('filename', pymongo.ASCENDING), ('uploadDate', pymongo.ASCENDING)]
+            )
+            self.chunk_size = 16000 * 1024 if chunk_size is None else chunk_size
+
         self.collection = self._db[self.collection_name]
+        self._log("DB name: '{}', Collection name: '{}'".format(self.name, self.collection_name))
 
     @staticmethod
     def uri_from_mongo_config(mongo_config_path):
@@ -81,7 +100,7 @@ class MongoStorage(Storage):
     def __apply_fn_to_nested_dict(self, original_dict, iter_dict=None, fn=None):
         if iter_dict is None:
             iter_dict = copy(original_dict)
-        for k, v in iter_dict.iteritems():
+        for k, v in iter_dict.items():
             if isinstance(v, MappingType):
                 original_dict[k] = self.__apply_fn_to_nested_dict(original_dict.get(k, {}), v, fn)
             else:
@@ -94,21 +113,28 @@ class MongoStorage(Storage):
 
     def __gridfs_ify(self, topic_store):
         """Places all bson.binary.Binary types in the gridfs files/storage system so no limit on 16MB documents"""
-        gridfs_put_kwargs = {"document_id": topic_store.id, "session_id": topic_store.session}
+        gridfs_put_kwargs = {
+            "document_id": topic_store.id, "session_id": topic_store.session, "chunkSize": self.chunk_size
+        }
 
         def __grid_fs_binary_objects(k, v):
             if isinstance(v, bson.binary.Binary):
+                self._log("Placing '{}' binary data into gridfs file storage".format(k))
                 return "__gridfs_file_" + k, self._fs.put(v, **gridfs_put_kwargs)
             return k, v
+
         parsed_dict = self.parser(topic_store.dict.copy())
         return self.__apply_fn_to_nested_dict(parsed_dict, fn=__grid_fs_binary_objects)
 
     def __ungridfs_ify(self, python_dict):
         """Gets all bson.binary.Binary types from the gridfs files/storage system"""
+
         def __populate_grid_fs_files(k, v):
             if k.startswith("__gridfs_file_") and isinstance(v, bson.objectid.ObjectId):
+                self._log("Retrieving '{}' binary data from gridfs file storage id='{}'".format(k, v))
                 return k.replace("__gridfs_file_", ""), bson.binary.Binary(self._fs.get(v).read())
             return k, v
+
         return self.__apply_fn_to_nested_dict(python_dict, fn=__populate_grid_fs_files)
 
     def insert_one(self, topic_store):
@@ -117,11 +143,16 @@ class MongoStorage(Storage):
         Returns:
             pymongo.results.InsertOneResult: Contains the ID for the inserted document
         """
+        if isinstance(topic_store, dict):
+            topic_store = TopicStore(topic_store)
         if not isinstance(topic_store, TopicStore):
             raise ValueError("Can only insert TopicStore items into the database not '{}'".format(type(topic_store)))
 
-        parsed_store = self.__gridfs_ify(topic_store)
-        return self.collection.insert_one(parsed_store)
+        if self._use_grid_fs:
+            parsed_dict = self.__gridfs_ify(topic_store)
+        else:
+            parsed_dict = self.parser(topic_store.dict.copy())
+        return self.collection.insert_one(parsed_dict)
 
     def update_one(self, query, update, *args, **kwargs):
         """Updates a single document matched by query"""
@@ -131,17 +162,61 @@ class MongoStorage(Storage):
         """Update a document field by ID changes all keys in kwargs"""
         return self.update_one(query={'_id': id_str}, update={"$set": kwargs})
 
+    @staticmethod
+    def __parse_find_args_kwargs(args, kwargs):
+        """Utility function to clean *args and **kwargs to collection.find() function calls"""
+        # Allow the user to not auto fetch blob data
+        skip_fetch_binary = kwargs.pop("skip_fetch_binary", False)
+        skip_on_error = kwargs.pop("skip_on_error", False)
+
+        # If projections exist we must append _ts_meta to it to reconstruct the original object
+        if len(args) >= 2 and isinstance(args[1], dict):
+            if all(x == 1 for x in args[1].values()):
+                args[1]["_ts_meta"] = 1  # Force _ts_meta always if projection is an inclusion rule
+            if "_ts_meta" in args[1] and args[1]["_ts_meta"] == 0:  # Don't allow the user to exclude _ts_meta
+                args[1].pop("_ts_meta")
+        if isinstance(kwargs, dict) and isinstance(kwargs.get("projection"), dict):
+            if all(x == 1 for x in kwargs["projection"].values()):
+                kwargs["projection"]["_ts_meta"] = 1
+            if "_ts_meta" in kwargs["projection"] and kwargs["projection"]["_ts_meta"] == 0:
+                kwargs["projection"].pop("_ts_meta")
+
+        return skip_fetch_binary, skip_on_error, args, kwargs
+
     def find(self, *args, **kwargs):
         """Returns TopicStoreCursor to all documents in the query"""
-        return TopicStoreCursor(self.collection.find(*args, **kwargs), apply_fn=self.__ungridfs_ify)
+        skip_fetch_binary, skip_on_error, args, kwargs = self.__parse_find_args_kwargs(args, kwargs)
+
+        find_cursor = self.collection.find(*args, **kwargs)
+
+        return TopicStoreCursor(find_cursor,
+                                apply_fn=None if (skip_fetch_binary or not self._use_grid_fs) else self.__ungridfs_ify,
+                                skip_on_error=skip_on_error)
 
     __iter__ = find
 
     def find_one(self, query, *args, **kwargs):
         """Returns a matched TopicStore document"""
-        parsed_document = self.reverse_parser(self.collection.find_one(query, *args, **kwargs))
-        parsed_document = self.__ungridfs_ify(parsed_document)
-        return TopicStore(parsed_document)
+        # TODO: remove FIND_ONE function in place of generic find function
+        skip_fetch_binary, skip_on_error, args, kwargs = self.__parse_find_args_kwargs(args, kwargs)
+
+        doc = None
+        try:
+            doc = self.collection.find_one(query, *args, **kwargs)
+            if not doc:  # Return if doc not found
+                return doc
+
+            parsed_document = self.reverse_parser(doc)
+            if not skip_fetch_binary and self._use_grid_fs:
+                parsed_document = self.__ungridfs_ify(parsed_document)
+            return TopicStore(parsed_document)
+        except Exception as e:
+            if not skip_on_error:
+                raise
+            print("Skipping document '{}' because '{}'".format(
+                (doc.get('id') + " ") if doc else None, e.message)
+            )
+            return doc
 
     def find_by_id(self, id_str, *args, **kwargs):
         """Returns a matched TopicStore document"""
@@ -149,21 +224,41 @@ class MongoStorage(Storage):
 
     def find_by_session_id(self, session_id, *args, **kwargs):
         """Returns matched TopicStore documents collected in the same session"""
+        if isinstance(session_id, str):
+            session_id = bson.ObjectId(session_id)
         return self.find({"_ts_meta.session": session_id}, *args, **kwargs)
 
     def get_unique_sessions(self):
         """Returns IDs of unique data collections scenario runs in the collection"""
-        return dict((x["_id"], {"time": x["sys_time"], "count": x["count"]}) for x in self.collection.aggregate([{
-            '$match': {'_ts_meta.session': {'$exists': True}}},
-            {'$group': {'_id': '$_ts_meta.session', 'sys_time': {'$first': "$_ts_meta.sys_time"}, "count": {'$sum': 1}}}
-        ]))
+        return dict((x["_id"], {"time": x["sys_time"], "count": x["count"], "date": x["date_collected"]}) for x in
+                    self.collection.aggregate(
+                        [{'$project': {'_ts_meta': 1}}, {'$match': {'_ts_meta.session': {'$exists': True}}}, {
+                            '$group': {'_id': '$_ts_meta.session', 'sys_time': {'$first': '$_ts_meta.sys_time'},
+                                       'count': {'$sum': 1}, 'date_collected': {'$first': {
+                                    '$dateFromParts': {'year': {'$year': '$_ts_meta.session'},
+                                                       'month': {'$month': '$_ts_meta.session'},
+                                                       'day': {'$dayOfMonth': '$_ts_meta.session'},
+                                                       'hour': {'$hour': '$_ts_meta.session'},
+                                                       'minute': {'$minute': '$_ts_meta.session'},
+                                                       'second': {'$second': '$_ts_meta.session'},
+                                                       'millisecond': {'$millisecond': '$_ts_meta.session'}}}}}}]))
+
+    def get_unique_sessions_fast(self, count=True):
+        """Returns IDs of unique data collections scenario runs in the collection quickly"""
+        return {s: {
+            "time": time.mktime(s.generation_time.timetuple()),
+            "date": s.generation_time,
+            "count": self.collection.count_documents({"_ts_meta.session": s}) if count else 0
+        } for s in sorted(list(self.collection.distinct("_ts_meta.session")), key=lambda x: x.generation_time)}
 
     def delete_by_id(self, id_str, *args, **kwargs):
         """Deletes a document by id"""
+
         def __delete_gridfs_docs(k, v):
             if k.startswith("__gridfs_file_") and isinstance(v, bson.objectid.ObjectId):
                 self._fs.delete(v)
             return k, v
+
         parsed_document = self.reverse_parser(self.collection.find_one({"_id": id_str}, *args, **kwargs))
         self.__apply_fn_to_nested_dict(parsed_document, fn=__delete_gridfs_docs)
         return self.collection.delete_one({"_id": id_str}, *args, **kwargs)
@@ -173,26 +268,41 @@ class MongoStorage(Storage):
         raise NotImplementedError("Not yet implemented since aggregate pipelines can be non TopicStore compatible docs")
         # return TopicStoreCursor(self.collection.aggregate(pipeline, *args, **kwargs))
 
+    def _log(self, *args, **kwargs):
+        if self.verbose:
+            print(*args, **kwargs)
+
 
 class TopicStoreCursor:
     """Wrapper for a pymongo.cursor.Cursor object to return documents as the TopicStore"""
-    def __init__(self, cursor, apply_fn=None):
+
+    def __init__(self, cursor, apply_fn=None, skip_on_error=False):
         self.parser = MongoDBReverseParser()
         self.apply_fn = apply_fn
+        self.skip_on_error = skip_on_error
         # Copy the cursor to this parent class
         self.cursor = cursor
 
+    def __get(self, cursor_ret):
+        document = None
+        try:
+            document = self.parser(cursor_ret)
+            if self.apply_fn:
+                document = self.apply_fn(document)
+            return TopicStore(document)
+        except Exception as e:
+            if not self.skip_on_error:
+                raise
+            print("Skipping document '{}' because '{}'".format(
+                (document.get('id') + " ") if document else None, e.message)
+            )
+            return document
+
     def __getitem__(self, item):
-        document = self.parser(self.cursor.__getitem__(item))
-        if self.apply_fn:
-            document = self.apply_fn(document)
-        return TopicStore(document)
+        return self.__get(self.cursor.__getitem__(item))
 
     def next(self):
-        document = self.parser(self.cursor.next())
-        if self.apply_fn:
-            document = self.apply_fn(document)
-        return TopicStore(document)
+        return self.__get(self.cursor.next())
 
     __next__ = next
 
